@@ -1,0 +1,282 @@
+# patch-validator configuration for this repository.
+#
+# The CI pipeline (.github/workflows/ci.yml) always overrides both revisions:
+#   --base-revision     merge-base of the pushed commit and main (the vulnerable baseline)
+#   --patched-revision  the pushed commit
+# and always reads this file and tests/ from the BASE revision, so a patch
+# cannot weaken its own oracles.
+#
+# Oracles below are the executable form of SPECIFICATION.md section 8.
+# They were written from the specification, not from any patched build.
+schema_version: 1
+base_dir: ".."
+
+target:
+  name: recparse
+  description: RECV1 binary record parser with a stack buffer overflow in the shared payload copy helper
+  language: c
+  repo_path: "."
+  source_subdir: "."
+  base_revision: main
+  patched_revision: HEAD
+
+builds:
+  - mode: release
+    compiler: gcc
+    cflags: "-O2 -g -fno-omit-frame-pointer"
+    ldflags: ""
+    commands:
+      - ["cmake", "-S", "{source}", "-B", "{build_dir}",
+         "-DCMAKE_BUILD_TYPE=None",
+         "-DCMAKE_C_COMPILER={compiler}",
+         "-DCMAKE_C_FLAGS={cflags}",
+         "-DCMAKE_EXE_LINKER_FLAGS={ldflags}"]
+      - ["cmake", "--build", "{build_dir}", "--parallel", "{jobs}"]
+    binary_path: "{build_dir}/recparse"
+
+  - mode: sanitized
+    compiler: gcc
+    cflags: "-O1 -g -fno-omit-frame-pointer -fno-common -fsanitize=address,undefined"
+    ldflags: "-fsanitize=address,undefined"
+    commands:
+      - ["cmake", "-S", "{source}", "-B", "{build_dir}",
+         "-DCMAKE_BUILD_TYPE=None",
+         "-DCMAKE_C_COMPILER={compiler}",
+         "-DCMAKE_C_FLAGS={cflags}",
+         "-DCMAKE_EXE_LINKER_FLAGS={ldflags}"]
+      - ["cmake", "--build", "{build_dir}", "--parallel", "{jobs}"]
+    binary_path: "{build_dir}/recparse"
+
+input:
+  method: file
+  argv: ["{input_file}"]
+  filename: input.bin
+
+limits:
+  timeout_s: 10
+  memory_mb: 1024
+  cpu_s: 10
+  max_processes: 64
+  max_output_bytes: 1048576
+
+sandbox:
+  backend: bubblewrap
+  network: false
+
+minimization:
+  enabled: true
+  max_iterations: 2000
+  budget_seconds: 120
+
+reproduction:
+  replays: 3
+
+tests:
+  # -- valid inputs ----------------------------------------------------
+  - id: valid_empty
+    category: valid
+    input: {path: tests/inputs/valid_empty.bin}
+    oracle:
+      source: specification
+      input_validity: valid
+      exit_code: 0
+      stdout: {match: exact, value: "records: 0\n"}
+      stderr: {match: absent}
+      semantics: A record count of zero produces only the header line.
+
+  - id: valid_text
+    category: valid
+    input: {path: tests/inputs/valid_text.bin}
+    oracle:
+      source: specification
+      input_validity: valid
+      exit_code: 0
+      stdout: {match: exact, value: "records: 1\nTEXT[11]: hello world\n"}
+      stderr: {match: absent}
+      semantics: A TEXT record is printed verbatim with its length.
+
+  - id: valid_text24
+    category: valid
+    note: 24 bytes is comfortably valid; a patch that tightens the limit below 31 breaks here.
+    input: {path: tests/inputs/valid_text24.bin}
+    oracle:
+      source: specification
+      input_validity: valid
+      exit_code: 0
+      stdout: {match: exact, value: "records: 1\nTEXT[24]: payload of 24 bytes.....\n"}
+      stderr: {match: absent}
+      semantics: TEXT payloads up to 31 bytes are valid and must be printed.
+
+  - id: valid_int32
+    category: valid
+    input: {path: tests/inputs/valid_int32.bin}
+    oracle:
+      source: specification
+      input_validity: valid
+      exit_code: 0
+      stdout: {match: exact, value: "records: 1\nINT32: -2\n"}
+      stderr: {match: absent}
+      semantics: INT32 is decoded little-endian as a signed value.
+
+  - id: valid_raw
+    category: valid
+    input: {path: tests/inputs/valid_raw.bin}
+    oracle:
+      source: specification
+      input_validity: valid
+      exit_code: 0
+      stdout: {match: exact, value: "records: 1\nRAW[4]: deadbeef\n"}
+      stderr: {match: absent}
+      semantics: RAW payloads are printed as lowercase hex without separators.
+
+  - id: valid_mixed
+    category: valid
+    input: {path: tests/inputs/valid_mixed.bin}
+    oracle:
+      source: specification
+      input_validity: valid
+      exit_code: 0
+      stdout: {match: exact, value: "records: 3\nTEXT[2]: ok\nINT32: 1\nRAW[3]: 010203\n"}
+      stderr: {match: absent}
+      semantics: Records are processed in order, one output line each.
+
+  # -- boundary inputs -------------------------------------------------
+  - id: boundary_text31
+    category: boundary
+    note: Largest payload that fits alongside the NUL terminator.
+    input: {path: tests/inputs/boundary_text31.bin}
+    oracle:
+      source: specification
+      input_validity: boundary
+      exit_code: 0
+      stdout: {match: exact, value: "records: 1\nTEXT[31]: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"}
+      stderr: {match: absent}
+      semantics: Length 31 is the inclusive upper bound for TEXT.
+
+  - id: boundary_text32
+    category: boundary
+    note: One past the limit. The release build does not fault here; only the sanitized build does.
+    input: {path: tests/inputs/boundary_text32.bin}
+    oracle:
+      source: specification
+      input_validity: boundary
+      exit_code: 2
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "too long"}
+      semantics: Length 32 must be rejected, not truncated and not processed.
+
+  - id: boundary_raw31
+    category: boundary
+    input: {path: tests/inputs/boundary_raw31.bin}
+    oracle:
+      source: specification
+      input_validity: boundary
+      exit_code: 0
+      stdout:
+        match: exact
+        value: "records: 1\nRAW[31]: 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n"
+      stderr: {match: absent}
+      semantics: Length 31 is the inclusive upper bound for RAW.
+
+  - id: boundary_raw32
+    category: boundary
+    input: {path: tests/inputs/boundary_raw32.bin}
+    oracle:
+      source: specification
+      input_validity: boundary
+      exit_code: 2
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "too long"}
+      semantics: Length 32 must be rejected for RAW as well as TEXT.
+
+  # -- security reproducers --------------------------------------------
+  - id: vuln_text_long
+    category: security
+    note: Original reproducer, reaches the copy helper through handle_text.
+    input: {path: tests/inputs/vuln_text_long.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 2
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "too long"}
+      semantics: An over-long TEXT record must be rejected without any out-of-bounds write.
+
+  - id: vuln_raw_long
+    category: security
+    note: Alternative reproducer, reaches the same helper through handle_raw.
+    input: {path: tests/inputs/vuln_raw_long.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 2
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "too long"}
+      semantics: An over-long RAW record must be rejected without any out-of-bounds write.
+
+  # -- invalid inputs --------------------------------------------------
+  - id: invalid_magic
+    category: invalid
+    input: {path: tests/inputs/invalid_magic.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 1
+      stdout: {match: exact, value: ""}
+      stderr: {match: contains, value: "bad magic"}
+      semantics: A stream that does not start with RECV1 is rejected.
+
+  - id: invalid_empty_file
+    category: invalid
+    input: {path: tests/inputs/invalid_empty_file.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 1
+      stdout: {match: exact, value: ""}
+      stderr: {match: contains, value: "bad magic"}
+      semantics: An empty stream is too short to carry a header.
+
+  - id: invalid_truncated_header
+    category: invalid
+    input: {path: tests/inputs/invalid_truncated_header.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 1
+      stdout: {match: exact, value: "records: 2\nTEXT[2]: ok\n"}
+      stderr: {match: contains, value: "truncated"}
+      semantics: Records already parsed are printed before the stream is rejected.
+
+  - id: invalid_truncated_payload
+    category: invalid
+    input: {path: tests/inputs/invalid_truncated_payload.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 1
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "truncated"}
+      semantics: A declared length larger than the remaining bytes is rejected.
+
+  - id: invalid_int32_len
+    category: invalid
+    input: {path: tests/inputs/invalid_int32_len.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 1
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "truncated"}
+      semantics: INT32 requires exactly four payload bytes.
+
+  - id: invalid_unknown_type
+    category: invalid
+    input: {path: tests/inputs/invalid_unknown_type.bin}
+    oracle:
+      source: specification
+      input_validity: invalid
+      exit_code: 3
+      stdout: {match: exact, value: "records: 1\n"}
+      stderr: {match: contains, value: "unknown record type"}
+      semantics: An unrecognised type tag is a distinct error from a malformed one.

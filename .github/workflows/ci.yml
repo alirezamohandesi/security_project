@@ -1,0 +1,395 @@
+# Security patch CI for recparse.
+#
+# Every push to a branch other than main is treated as a candidate security
+# patch against the vulnerable baseline on main.  The pipeline:
+#
+#   prepare ─┬─ static-analysis ─────────────────────────┐
+#            ├─ build (gcc|clang × release|sanitized) ─┬─ functional-tests ─┤
+#            │                                         └─ patch-validation ─┤
+#            └─────────────────────────────────────────────────────────────┴─ verdict
+#
+# patch-validator (https://github.com/mohammaderfanali/patch-validator) is the
+# dynamic security gate: it builds base and patched revisions in release and
+# sanitized modes, runs every test in a bubblewrap sandbox and decides whether
+# the vulnerability is really fixed without breaking specified behaviour.
+#
+# Trust boundary: the oracles (.patch-validator/) and test inputs (tests/) are
+# always taken from the BASE revision, never from the patch under review, so a
+# patch cannot make itself pass by editing its own tests.
+name: security-patch-ci
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned so a change in the tool can never silently change a verdict.
+  PATCH_VALIDATOR_REPO: mohammaderfanali/patch-validator
+  PATCH_VALIDATOR_REF: c8611820af84567f5a1e3303cb9529ed855587c9
+  CONFIG: .patch-validator/recparse.yaml
+  TRUSTED_PATHS: .patch-validator tests SPECIFICATION.md
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Work out what is being validated: base = merge-base with main,
+  #    patched = the pushed commit.  Publishes the patch diff.
+  # -------------------------------------------------------------------------
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.revs.outputs.base }}
+      patched: ${{ steps.revs.outputs.patched }}
+      skip: ${{ steps.revs.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve base and patched revisions
+        id: revs
+        run: |
+          git fetch --no-tags origin main
+          base=$(git merge-base origin/main HEAD)
+          patched=$(git rev-parse HEAD)
+          echo "base=$base"       >> "$GITHUB_OUTPUT"
+          echo "patched=$patched" >> "$GITHUB_OUTPUT"
+
+          code_changes=$(git diff --name-only "$base" "$patched" -- 'src/' 'CMakeLists.txt' | wc -l)
+          if [ "$base" = "$patched" ] || [ "$code_changes" -eq 0 ]; then
+            echo "::notice::no source changes against main; nothing to validate"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Warn when the patch touches the oracles or tests: those edits are
+          # ignored by this pipeline and need a separate review on main.
+          tampered=$(git diff --name-only "$base" "$patched" -- $TRUSTED_PATHS .github || true)
+          if [ -n "$tampered" ]; then
+            echo "::warning::patch modifies trusted files (ignored by this pipeline): $(echo $tampered)"
+          fi
+
+          git diff "$base" "$patched" > patch.diff
+          {
+            echo "## Patch under review"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| branch | \`${GITHUB_REF_NAME}\` |"
+            echo "| author | $(git log -1 --format='%an' "$patched") |"
+            echo "| base (merge-base with main) | \`${base:0:12}\` |"
+            echo "| patched | \`${patched:0:12}\` — $(git log -1 --format='%s' "$patched") |"
+            echo
+            echo '```'
+            git diff --stat "$base" "$patched"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patch-diff
+          path: patch.diff
+
+  # -------------------------------------------------------------------------
+  # 2. Static analysis.  Informational: findings are reported, but the
+  #    dynamic validator is the authority on the security verdict.
+  # -------------------------------------------------------------------------
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-24.04
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install analysers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck gcc
+
+      - name: cppcheck
+        continue-on-error: true
+        run: |
+          cppcheck --std=c11 --enable=warning,style,portability \
+            --inline-suppr --error-exitcode=1 -I src src/ 2>&1 | tee cppcheck.txt
+
+      - name: gcc -fanalyzer
+        continue-on-error: true
+        run: |
+          gcc -std=c11 -fanalyzer -Wall -Wextra -Isrc -c src/*.c -o /dev/null 2>&1 | tee analyzer.txt || true
+          gcc -std=c11 -fanalyzer -Isrc src/main.c src/record.c -o /dev/null 2>&1 | tee -a analyzer.txt
+          ! grep -q 'warning:' analyzer.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: static-analysis
+          path: |
+            cppcheck.txt
+            analyzer.txt
+
+  # -------------------------------------------------------------------------
+  # 3. Build the patched revision with two compilers in both modes, warnings
+  #    as errors.  A patch that does not compile cleanly stops here.
+  # -------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.compiler }}, ${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        mode: [release, sanitized]
+        include:
+          - mode: release
+            cflags: "-O2 -g -Wall -Wextra -Wpedantic -Werror -D_FORTIFY_SOURCE=2"
+            ldflags: ""
+          - mode: sanitized
+            cflags: "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Wall -Wextra -Werror"
+            ldflags: "-fsanitize=address,undefined"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang cmake
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=None \
+            -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+            "-DCMAKE_C_FLAGS=${{ matrix.cflags }}" \
+            "-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.ldflags }}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recparse-${{ matrix.compiler }}-${{ matrix.mode }}
+          path: build/recparse
+
+  # -------------------------------------------------------------------------
+  # 4. Functional tests: the patched binary must still meet the specification
+  #    on valid, boundary and malformed inputs.  Fast feedback, sanitizers on.
+  # -------------------------------------------------------------------------
+  functional-tests:
+    name: functional tests (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    needs: [prepare, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use trusted tests from the base revision
+        run: git restore --source="${{ needs.prepare.outputs.base }}" -- $TRUSTED_PATHS
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: recparse-${{ matrix.compiler }}-sanitized
+          path: bin
+
+      - name: Run the functional suite
+        run: |
+          chmod +x bin/recparse
+          pip install --quiet PyYAML
+          python3 tests/run_functional.py \
+            --binary bin/recparse \
+            --config "$CONFIG" \
+            --categories valid,boundary,invalid \
+            --junit functional-${{ matrix.compiler }}.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functional-results-${{ matrix.compiler }}
+          path: functional-${{ matrix.compiler }}.xml
+
+  # -------------------------------------------------------------------------
+  # 5. Dynamic patch validation with patch-validator — the security gate.
+  # -------------------------------------------------------------------------
+  patch-validation:
+    name: patch-validator
+    runs-on: ubuntu-24.04
+    needs: [prepare, build]
+    outputs:
+      exit_code: ${{ steps.validate.outputs.exit_code }}
+      verdict: ${{ steps.validate.outputs.verdict }}
+    env:
+      BASE: ${{ needs.prepare.outputs.base }}
+      PATCHED: ${{ needs.prepare.outputs.patched }}
+      # Recorded in every reproducer bundle so a finding can be tied to the
+      # exact tool version and commit that produced it.
+      PATCH_VALIDATOR_IMAGE_DIGEST: ${{ github.sha }}
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          path: target
+          fetch-depth: 0
+
+      - name: Checkout patch-validator
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PATCH_VALIDATOR_REPO }}
+          ref: ${{ env.PATCH_VALIDATOR_REF }}
+          path: tool
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bubblewrap util-linux binutils build-essential cmake git
+
+      - name: Allow unprivileged user namespaces for the sandbox
+        # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor,
+        # which bubblewrap needs.  The runner is ephemeral.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Install patch-validator
+        run: pip install ./tool
+
+      - name: Check the environment (doctor)
+        run: patch-validator doctor
+
+      - name: Use trusted oracles and tests from the base revision
+        working-directory: target
+        run: git restore --source="$BASE" -- $TRUSTED_PATHS
+
+      - name: Validate the configuration
+        working-directory: target
+        run: |
+          patch-validator check-config --config "$CONFIG" \
+            --base-revision "$BASE" --patched-revision "$PATCHED"
+
+      - name: Compare binary hardening
+        working-directory: target
+        continue-on-error: true
+        run: |
+          patch-validator hardening --config "$CONFIG" \
+            --base-revision "$BASE" --patched-revision "$PATCHED" \
+            --run-dir ../runs/hardening
+
+      - name: Validate the patch
+        id: validate
+        working-directory: target
+        run: |
+          set +e
+          patch-validator validate --config "$CONFIG" \
+            --base-revision "$BASE" --patched-revision "$PATCHED" \
+            --run-dir ../runs/validation
+          code=$?
+          case $code in
+            0)  verdict="PASS" ;;
+            10) verdict="VULN_REMAINS_OR_NEW_ISSUE" ;;
+            20) verdict="FUNC_REGRESSION" ;;
+            30) verdict="BUILD_OR_CONFIG_ERROR" ;;
+            40) verdict="INCONCLUSIVE" ;;
+            *)  verdict="UNKNOWN($code)" ;;
+          esac
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Re-run the generated regression suite
+        if: always()
+        working-directory: target
+        continue-on-error: true
+        run: |
+          suite=../runs/validation/regression/suite.json
+          if [ -f "$suite" ]; then
+            patch-validator regression --config "$CONFIG" \
+              --base-revision "$BASE" --patched-revision "$PATCHED" \
+              --suite "$suite" --run-dir ../runs/regression
+          else
+            echo "no regression suite was generated"
+          fi
+
+      - name: Publish the report
+        if: always()
+        run: |
+          patch-validator report --run runs/validation --format summary || true
+          if [ -f runs/validation/report.md ]; then
+            {
+              echo "## patch-validator: ${{ steps.validate.outputs.verdict }} (exit ${{ steps.validate.outputs.exit_code }})"
+              echo
+              cat runs/validation/report.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-validator-run
+          path: runs/
+          if-no-files-found: warn
+
+      # The exit code is never swallowed: any verdict other than PASS fails
+      # this job and, through the verdict job, the pipeline.
+      - name: Enforce the verdict
+        run: |
+          code="${{ steps.validate.outputs.exit_code }}"
+          if [ "$code" != "0" ]; then
+            echo "::error title=patch-validator::${{ steps.validate.outputs.verdict }} (exit $code) — see the job summary and the patch-validator-run artifact"
+            exit 1
+          fi
+          echo "patch accepted"
+
+  # -------------------------------------------------------------------------
+  # 6. Single required status check that merges all results.
+  # -------------------------------------------------------------------------
+  verdict:
+    name: verdict
+    runs-on: ubuntu-24.04
+    needs: [prepare, static-analysis, build, functional-tests, patch-validation]
+    if: always()
+    steps:
+      - name: Summarise and gate
+        run: |
+          {
+            echo "## Pipeline verdict"
+            echo
+            echo "| job | result |"
+            echo "|---|---|"
+            echo "| prepare | ${{ needs.prepare.result }} |"
+            echo "| static analysis (informational) | ${{ needs.static-analysis.result }} |"
+            echo "| build | ${{ needs.build.result }} |"
+            echo "| functional tests | ${{ needs.functional-tests.result }} |"
+            echo "| patch-validator | ${{ needs.patch-validation.result }} — ${{ needs.patch-validation.outputs.verdict }} (exit ${{ needs.patch-validation.outputs.exit_code }}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.prepare.outputs.skip }}" = "true" ]; then
+            echo "no source changes; nothing to gate"
+            exit 0
+          fi
+          for r in "${{ needs.prepare.result }}" "${{ needs.build.result }}" \
+                   "${{ needs.functional-tests.result }}" "${{ needs.patch-validation.result }}"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::patch rejected"
+              exit 1
+            fi
+          done
+          echo "patch accepted"
