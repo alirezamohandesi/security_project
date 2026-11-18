@@ -27,6 +27,12 @@ static int handle_text(const uint8_t *payload, size_t len)
 {
     char buf[TEXT_BUF_SIZE];
 
+    /* Reject over-long text payloads before they reach the copy helper. */
+    if (len >= TEXT_BUF_SIZE) {
+        fprintf(stderr, "error: text record too long (%zu bytes)\n", len);
+        return RC_TOO_LONG;
+    }
+
     if (copy_payload(buf, sizeof(buf), payload, len) != 0) {
         fprintf(stderr, "error: text record too long (%zu bytes)\n", len);
         return RC_TOO_LONG;
