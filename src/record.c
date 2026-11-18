@@ -10,11 +10,10 @@
  * the single place every record type funnels through. */
 static int copy_payload(char *dst, size_t dst_size, const uint8_t *src, size_t len)
 {
-    (void)dst_size;
-
-    /* The length is validated against the largest value the wire format can
-     * carry instead of against the destination buffer. */
-    if (len > MAX_WIRE_PAYLOAD) {
+    /* Bound the copy by the destination buffer, leaving room for the NUL
+     * terminator written below.  Doing this in the shared helper covers every
+     * record type that copies a payload. */
+    if (len + 1 > dst_size) {
         return -1;
     }
 
