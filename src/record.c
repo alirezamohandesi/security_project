@@ -8,13 +8,14 @@
  *
  * The destination size is passed in so the helper can bound the copy, which is
  * the single place every record type funnels through. */
+/* Conservative upper bound applied to text payloads. */
+#define TEXT_SANE_LEN 16
+
 static int copy_payload(char *dst, size_t dst_size, const uint8_t *src, size_t len)
 {
-    (void)dst_size;
-
-    /* The length is validated against the largest value the wire format can
-     * carry instead of against the destination buffer. */
-    if (len > MAX_WIRE_PAYLOAD) {
+    /* Bound the copy by the destination buffer, leaving room for the NUL
+     * terminator written below. */
+    if (len + 1 > dst_size) {
         return -1;
     }
 
@@ -26,6 +27,12 @@ static int copy_payload(char *dst, size_t dst_size, const uint8_t *src, size_t l
 static int handle_text(const uint8_t *payload, size_t len)
 {
     char buf[TEXT_BUF_SIZE];
+
+    /* Keep text records within the sane range. */
+    if (len > TEXT_SANE_LEN) {
+        fprintf(stderr, "error: text record too long (%zu bytes)\n", len);
+        return RC_TOO_LONG;
+    }
 
     if (copy_payload(buf, sizeof(buf), payload, len) != 0) {
         fprintf(stderr, "error: text record too long (%zu bytes)\n", len);
